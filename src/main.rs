@@ -1,21 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{hash_map, HashMap};
 use std::fmt::{Display, Formatter};
 use std::process::ExitCode;
 use std::time::Duration;
 use reqwest::{Client, Error, StatusCode};
 use serde::{Serialize};
 use serde_json::Value;
-use tracing::{debug, error, Level};
+use tracing::{debug, error, info, Level};
+use std::env;
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 struct Config {
-    log_level: Level,
     qb_address: String,
     qb_username: String,
     qb_password: String,
     jellyfin_address: String,
     jellyfin_api_token: String,
-    jellyfin_active_within_secs: u32,
+    jellyfin_active_within_secs: u64,
+    poll_time_secs: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -63,29 +65,31 @@ impl From<Error> for ThrottlerError {
     }
 }
 
+fn apply_env<I>(current_env: &mut HashMap<String, Option<String>>, load_env: I) where I: Iterator<Item=(String, String)> {
+    for env_var in load_env {
+        if let hash_map::Entry::Occupied(mut e) = current_env.entry(env_var.0) {
+            e.insert(Some(env_var.1.to_string()));
+        }
+    }
+}
+
+const DEFAULT_POLL_TIME_SECS: u64 = 5;
+const DEFAULT_JELLYFIN_ACTIVE_WITHIN_SECS: u64 = 5;
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let config = Config {
-        log_level: Level::DEBUG,
-        qb_address: "https://qbittorrent.ryancarins.info".to_string(),
-        qb_username: "".to_string(),
-        qb_password: "".to_string(),
-        jellyfin_address: "http://192.168.1.12:8096".to_string(),
-        jellyfin_api_token: "".to_string(),
-        jellyfin_active_within_secs: 60
-    };
-
     let collector = tracing_subscriber::fmt()
-        // filter spans/events with level TRACE or higher.
-        .with_max_level(config.log_level)
-        // build but do not install the subscriber.
+        .with_max_level(get_log_level())
         .finish();
-
     tracing::subscriber::set_global_default(collector).unwrap();
 
-    debug!("Starting up");
-    let client = Client::new();
+    let config = match load_config() {
+        Ok(config) => {config}
+        Err(err) => {return err}
+    };
 
+    info!("Starting up");
+    let client = Client::new();
 
     loop {
         let cookie_req = qb_auth(&client, &config).await;
@@ -93,13 +97,22 @@ async fn main() -> ExitCode {
         let cookie = match cookie_req {
             Ok(cookie) => { cookie }
             Err(err) => {
-                error!("{err}");
-                if let ThrottlerError::BadResponse(_, code) = err {
-                    //Exit the loop to re-auth if auth fails
-                    if code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN {
+                match err {
+                    ThrottlerError::BadResponse(_, code) => {
+                        if code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN {
+                            error!("qBittorrent Auth failed critically. Check credentials");
+                            break;
+                        }
+                    }
+                    ThrottlerError::NoCookie => {
+                        error!("qBittorrent Auth failed critically. Check credentials");
                         break;
+                    },
+                    _ => {
+                        info!("Auth failure not critical, retrying in {} seconds", config.poll_time_secs)
                     }
                 }
+
                 //Any errors that aren't auth related should be solved by waiting
                 continue;
             }
@@ -130,11 +143,71 @@ async fn main() -> ExitCode {
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(config.poll_time_secs)).await;
         }
     }
 
     0.into()
+}
+
+fn get_log_level() -> Level {
+    let mut log_level = Level::INFO;
+    let env_log_level = env::var("QB_THROTTLER_LOG_LEVEL");
+    let dot_env_log_level = dotenv::var("QB_THROTTLER_LOG_LEVEL");
+
+    if env_log_level.is_ok() {
+        log_level = Level::from_str(&env_log_level.unwrap()).unwrap_or(log_level);
+    }
+
+    if dot_env_log_level.is_ok() {
+        log_level = Level::from_str(&dot_env_log_level.unwrap()).unwrap_or(log_level);
+    }
+
+    log_level
+}
+
+fn load_config() -> Result<Config, ExitCode> {
+    let env_vars = env::vars();
+    let dot_env_vars = dotenv::vars();
+
+    //Start with defaults
+    let mut env_config: HashMap<String, Option<String>> = HashMap::from([
+        ("QB_ADDRESS".to_string(), None),
+        ("QB_USERNAME".to_string(), None),
+        ("QB_PASSWORD".to_string(), None),
+        ("JELLYFIN_ADDR".to_string(), None),
+        ("JELLYFIN_TOKEN".to_string(), None),
+        ("JELLYFIN_ACTIVE_WITHIN_SECS".to_string(), Some("5".to_string())),
+        ("QB_THROTTLER_POLL_FREQ".to_string(), Some("5".to_string()))
+    ]);
+
+    apply_env(&mut env_config, env_vars);
+
+    //Dotenv is more specific so we override system env with it
+    apply_env(&mut env_config, dot_env_vars);
+
+    if env_config.iter().any(|x| x.1.is_none()) {
+        for entry in env_config.iter().filter(|x| x.1.is_none()) {
+            error!("Config is missing missing for env variable: {}", entry.0);
+        }
+        return Err(1.into());
+    }
+
+    Ok(Config {
+        qb_address: env_config["QB_ADDRESS"].as_ref().unwrap().to_string(),
+        qb_username: env_config["QB_USERNAME"].as_ref().unwrap().to_string(),
+        qb_password: env_config["QB_PASSWORD"].as_ref().unwrap().to_string(),
+        jellyfin_address: env_config["JELLYFIN_ADDR"].as_ref().unwrap().to_string(),
+        jellyfin_api_token: env_config["JELLYFIN_TOKEN"].as_ref().unwrap().to_string(),
+        jellyfin_active_within_secs: env_config["JELLYFIN_ACTIVE_WITHIN_SECS"].as_ref().unwrap().trim().parse().unwrap_or_else(|_| {
+            error!("JELLYFIN_ACTIVE_WITHIN_SECS env var was not a valid integer. Defaulting to {DEFAULT_JELLYFIN_ACTIVE_WITHIN_SECS}");
+            DEFAULT_JELLYFIN_ACTIVE_WITHIN_SECS
+        }),
+        poll_time_secs: env_config["QB_THROTTLER_POLL_FREQ"].as_ref().unwrap().trim().parse().unwrap_or_else(|_| {
+            error!("JELLYFIN_ACTIVE_WITHIN_SECS env var was not a valid integer. Defaulting to {DEFAULT_POLL_TIME_SECS}");
+            DEFAULT_POLL_TIME_SECS
+        })
+    })
 }
 
 async fn jellyfin_get_sessions(client: &Client, config: &Config) -> Result<usize, ThrottlerError> {
